@@ -155,6 +155,27 @@ Disabling restores the fan mode that was active before turbo was enabled.
 echo '1' | sudo tee /sys/devices/platform/aorus_laptop/fan_turbo
 ```
 
+## Gaming thermal boost (Gigabyte Gaming models only)
+
+Addresses inadequate gaming-mode fan curves on models like the A16 CWH,
+where GPU power can drop from 70W toward 55–60W under load because fans
+stay near ~3000 RPM. While `fan_mode` is gaming (2), the driver polls GPU
+temperature and fan RPM every two seconds and escalates custom fan duty
+in steps (70% / 80% / 90% / 100%). If WMI GPU temperature reads low but
+fans are not spinning fast enough, duty is raised anyway. When the GPU
+cools below 45°C, gaming mode is restored. Mutually exclusive with
+`fan_turbo`. 0 = off, 1 = on.
+
+Requires gaming fan mode before enabling:
+
+**Node:** `/sys/devices/platform/aorus_laptop/fan_gaming_boost`
+
+**Example:**
+```
+echo '2' | sudo tee /sys/devices/platform/aorus_laptop/fan_mode
+echo '1' | sudo tee /sys/devices/platform/aorus_laptop/fan_gaming_boost
+```
+
 ## GPU boost on Gigabyte Gaming models
 
 On Gigabyte Gaming models, `gpu_boost` only accepts 0 or 1 (CTGP boost off/on).

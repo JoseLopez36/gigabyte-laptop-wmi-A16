@@ -21,8 +21,9 @@ echo "Fan 2 RPM: $(cat "$HWMON/fan2_input")"
 echo "fan_mode:      $(cat "$SYS/fan_mode")"
 echo "charge_mode:   $(cat "$SYS/charge_mode")"
 echo "charge_limit:  $(cat "$SYS/charge_limit")"
-echo "fan_turbo:     $(cat "$SYS/fan_turbo")"
-echo "dynamic_boost: $(cat "$SYS/dynamic_boost")"
+echo "fan_turbo:         $(cat "$SYS/fan_turbo")"
+echo "fan_gaming_boost:  $(cat "$SYS/fan_gaming_boost")"
+echo "dynamic_boost:     $(cat "$SYS/dynamic_boost")"
 
 echo
 echo "== fan_turbo test (10 seconds) =="
@@ -30,6 +31,14 @@ echo 1 > "$SYS/fan_turbo" && echo "write 1: OK"
 sleep 10
 echo "fan_turbo: $(cat "$SYS/fan_turbo"), RPMs: $(cat "$HWMON/fan1_input") / $(cat "$HWMON/fan2_input")"
 echo 0 > "$SYS/fan_turbo" && echo "write 0: OK"
+
+echo
+echo "== fan_gaming_boost (requires fan_mode=2) =="
+echo 2 > "$SYS/fan_mode"
+echo 1 > "$SYS/fan_gaming_boost" && echo "write 1: OK"
+sleep 3
+echo "fan_gaming_boost: $(cat "$SYS/fan_gaming_boost"), fan_mode: $(cat "$SYS/fan_mode")"
+echo 0 > "$SYS/fan_gaming_boost" && echo "write 0: OK"
 
 echo
 echo "== Max performance: perf_mode=2 + gpu_boost=1 + dynamic_boost=1 =="
