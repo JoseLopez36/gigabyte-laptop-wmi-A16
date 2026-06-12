@@ -28,7 +28,13 @@ echo
 echo "== fan_turbo test (10 seconds) =="
 echo 1 > "$SYS/fan_turbo" && echo "write 1: OK"
 sleep 10
-echo "fan_turbo: $(cat "$SYS/fan_turbo"), RPMs: $(cat "$HWMON/fan1_input") / $(cat "$HWMON/fan2_input")"
+RPM1=$(cat "$HWMON/fan1_input")
+RPM2=$(cat "$HWMON/fan2_input")
+echo "fan_turbo: $(cat "$SYS/fan_turbo"), RPMs: $RPM1 / $RPM2"
+if [ "$RPM1" -lt 6000 ] || [ "$RPM2" -lt 6000 ]; then
+	echo "FAIL: turbo fan RPM below 6000 (expected ~6500 on A16 CWH)"
+	exit 1
+fi
 echo 0 > "$SYS/fan_turbo" && echo "write 0: OK"
 
 echo

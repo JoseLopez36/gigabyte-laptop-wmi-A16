@@ -852,14 +852,14 @@ static DEVICE_ATTR_RW(debug_method);
 
 static bool gigabyte_fan_turbo_hw_active(void)
 {
-	int tenf, duty, ret;
+	int val, ret;
 
-	ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_MODE, &tenf);
-	if (ret || !tenf)
+	ret = gigabyte_laptop_get_devstate(FAN_FIXED_MODE, &val);
+	if (ret || !val)
 		return false;
 
-	ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_SPEED, &duty);
-	if (ret || duty != FAN_DUTY_MAX)
+	ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_SPEED, &val);
+	if (ret || val != FAN_DUTY_MAX)
 		return false;
 
 	return true;
@@ -877,14 +877,15 @@ static int gigabyte_fan_turbo_apply_max(struct device *dev)
 {
 	ssize_t ret;
 
-	ret = fan_mode_store(dev, &dev_attr_fan_mode, "3\n", 2);
+	ret = fan_custom_speed_store(dev, &dev_attr_fan_custom_speed,
+				     "100\n", 4);
 	if (ret < 0)
 		return (int)ret;
 
 	msleep(100);
 
-	ret = fan_custom_speed_store(dev, &dev_attr_fan_custom_speed,
-				     "100\n", 4);
+	/* Fixed mode at max duty runs fans at full speed on the A16 CWH. */
+	ret = fan_mode_store(dev, &dev_attr_fan_mode, "5\n", 2);
 	if (ret < 0)
 		return (int)ret;
 
@@ -906,7 +907,7 @@ static int gigabyte_fan_turbo_apply_max_usermode(struct device *dev)
 		return -ENOMEM;
 
 	cmd = kasprintf(GFP_KERNEL,
-			"echo 3 > /sys%s/fan_mode && echo 100 > /sys%s/fan_custom_speed",
+			"echo 100 > /sys%s/fan_custom_speed && echo 5 > /sys%s/fan_mode",
 			kpath, kpath);
 	kfree(kpath);
 	if (!cmd)
@@ -969,6 +970,20 @@ static void gigabyte_fan_turbo_work_fn(struct work_struct *work)
 			goto done;
 		}
 
+		if (gigabyte->fan_turbo_saved_mode == 3 &&
+		    gigabyte->fan_turbo_saved_display_speed != 100) {
+			snprintf(mode_buf, sizeof(mode_buf), "%d\n",
+				 gigabyte->fan_turbo_saved_display_speed);
+			ret = fan_custom_speed_store(dev,
+					&dev_attr_fan_custom_speed, mode_buf,
+					strlen(mode_buf));
+			if (ret < 0) {
+				pr_warn("turbo fan: restore fan speed failed (%d)\n",
+					(int)ret);
+				goto done;
+			}
+		}
+
 		gigabyte->fan_turbo_active = 0;
 		pr_info("turbo fan: disabled\n");
 	}
@@ -980,8 +995,7 @@ done:
 
 /*
  * Turbo fan (Gigabyte Gaming models, e.g. A16 CWH).
- * Engages custom mode at 100% duty. TFAN is not written on enable because it
- * can latch while TENF is still off on the A16 CWH.
+ * Engages fixed fan mode at 100% custom duty (max RPM on the A16 CWH).
  */
 static ssize_t fan_turbo_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
