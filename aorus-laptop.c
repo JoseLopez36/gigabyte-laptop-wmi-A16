@@ -69,11 +69,6 @@ MODULE_VERSION(GIGABYTE_LAPTOP_VERSION);
 #define FAN_CURVE_POINTS 15
 #define FAN_DUTY_MAX     0xE5 // 100% custom fan duty
 
-/* Gaming-mode thermal boost (A16 CWH): poll GPU temp + RPM, ramp custom duty */
-#define FAN_GAMING_BOOST_POLL_MS  2000
-#define FAN_GAMING_BOOST_LEVELS   4
-#define FAN_GAMING_BOOST_IDLE_TEMP 45
-
 struct fan_curve_data {
 	u8 temperature[FAN_CURVE_POINTS];
 	u8 speed[FAN_CURVE_POINTS];
@@ -106,11 +101,6 @@ struct gigabyte_laptop_wmi {
 	struct device *fan_turbo_dev;
 	bool fan_turbo_work_enable;
 	int fan_turbo_work_result;
-	u8 fan_gaming_boost_enabled;
-	u8 fan_gaming_boost_level;
-	u8 fan_gaming_boost_active;
-	struct delayed_work fan_gaming_boost_work;
-	struct device *fan_gaming_boost_dev;
 };
 
 static struct platform_device *platform_device;
@@ -454,14 +444,6 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
 	}
 
 	gigabyte->fan_mode = fan_mode;
-
-	if (gigabyte->fan_gaming_boost_enabled && fan_mode != 2) {
-		cancel_delayed_work_sync(&gigabyte->fan_gaming_boost_work);
-		gigabyte->fan_gaming_boost_enabled = 0;
-		gigabyte->fan_gaming_boost_level = 0;
-		gigabyte->fan_gaming_boost_active = 0;
-	}
-
 	return count;
 }
 
@@ -550,29 +532,6 @@ static ssize_t fan_custom_speed_store(struct device *dev, struct device_attribut
 	if (ret)
 		return ret;
 	return count;
-}
-
-static u8 gigabyte_fan_display_to_duty(int display)
-{
-	switch (display) {
-	case 25: return 0x39;
-	case 30: return 0x44;
-	case 35: return 0x50;
-	case 40: return 0x5B;
-	case 45: return 0x67;
-	case 50: return 0x72;
-	case 55: return 0x7D;
-	case 60: return 0x89;
-	case 65: return 0x94;
-	case 70: return 0xA0;
-	case 75: return 0xAB;
-	case 80: return 0xB7;
-	case 85: return 0xC2;
-	case 90: return 0xCE;
-	case 95: return 0xD9;
-	case 100: return FAN_DUTY_MAX;
-	default: return 0;
-	}
 }
 
 /*
@@ -763,13 +722,6 @@ static ssize_t dynamic_boost_store(struct device *dev, struct device_attribute *
 static ssize_t fan_turbo_show(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t fan_turbo_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count);
-static ssize_t fan_gaming_boost_show(struct device *dev,
-				     struct device_attribute *attr, char *buf);
-static ssize_t fan_gaming_boost_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count);
-static void gigabyte_fan_gaming_boost_stop(struct gigabyte_laptop_wmi *gigabyte,
-					   struct device *dev);
 
 static ssize_t fan_curve_index_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -892,257 +844,11 @@ static DEVICE_ATTR_RW(charge_limit);
 static DEVICE_ATTR_RW(gpu_boost);
 static DEVICE_ATTR_RW(perf_mode);
 static DEVICE_ATTR_RW(fan_turbo);
-static DEVICE_ATTR_RW(fan_gaming_boost);
 static DEVICE_ATTR_RW(dynamic_boost);
 static DEVICE_ATTR_RW(fan_curve_index);
 static DEVICE_ATTR_RW(fan_curve_data);
 static DEVICE_ATTR_RO(battery_cycle);
 static DEVICE_ATTR_RW(debug_method);
-
-static int gigabyte_sysfs_usermode_cmd(char *cmd)
-{
-	char *argv[] = { "/bin/sh", "-c", cmd, NULL };
-	char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
-
-	return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-}
-
-static const int fan_gaming_boost_on_temp[] = { 0, 50, 58, 65, 72 };
-static const int fan_gaming_boost_off_temp[] = { 0, 47, 55, 62, 69 };
-static const int fan_gaming_boost_duty[] = { 0, 70, 80, 90, 100 };
-static const int fan_gaming_boost_rpm_floor[] = { 0, 4200, 5000, 5700, 6200 };
-
-static int gigabyte_fan_max_rpm(void)
-{
-	int r1, r2, ret;
-
-	ret = gigabyte_laptop_get_devstate(FAN_CPU_RPM, &r1);
-	if (ret)
-		return 0;
-	ret = gigabyte_laptop_get_devstate(FAN_GPU_RPM, &r2);
-	if (ret)
-		return r1;
-	return max(r1, r2);
-}
-
-static int fan_gaming_boost_compute_level(int cur_level, int gpu_temp, int max_rpm)
-{
-	int temp_level, rpm_level, level;
-
-	if (gpu_temp < FAN_GAMING_BOOST_IDLE_TEMP)
-		return 0;
-
-	temp_level = cur_level;
-	while (temp_level > 0 && gpu_temp < fan_gaming_boost_off_temp[temp_level])
-		temp_level--;
-	while (temp_level < FAN_GAMING_BOOST_LEVELS &&
-	       gpu_temp >= fan_gaming_boost_on_temp[temp_level + 1])
-		temp_level++;
-
-	rpm_level = 0;
-	while (rpm_level < FAN_GAMING_BOOST_LEVELS &&
-	       max_rpm < fan_gaming_boost_rpm_floor[rpm_level + 1])
-		rpm_level++;
-
-	level = max(temp_level, rpm_level);
-	return max(level, 1);
-}
-
-static bool gigabyte_fan_gaming_boost_hw_ok(int level)
-{
-	int tenf, duty, ret;
-	u8 expected;
-
-	if (level == 0)
-		return true;
-
-	ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_MODE, &tenf);
-	if (ret || !tenf)
-		return false;
-
-	expected = gigabyte_fan_display_to_duty(fan_gaming_boost_duty[level]);
-	ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_SPEED, &duty);
-	return !ret && duty == expected;
-}
-
-static int gigabyte_fan_gaming_boost_apply_usermode(struct device *dev, int duty)
-{
-	char *kpath, *cmd;
-	int ret;
-
-	kpath = kobject_get_path(&dev->kobj, GFP_KERNEL);
-	if (!kpath)
-		return -ENOMEM;
-
-	cmd = kasprintf(GFP_KERNEL,
-			"echo 3 > /sys%s/fan_mode && echo %d > /sys%s/fan_custom_speed",
-			kpath, duty, kpath);
-	kfree(kpath);
-	if (!cmd)
-		return -ENOMEM;
-
-	ret = gigabyte_sysfs_usermode_cmd(cmd);
-	kfree(cmd);
-	return ret;
-}
-
-static int fan_gaming_boost_apply_level(struct device *dev,
-					struct gigabyte_laptop_wmi *gigabyte,
-					int level)
-{
-	char speed_buf[8];
-	int duty, ret;
-	ssize_t sret;
-
-	if (level == 0) {
-		sret = fan_mode_store(dev, &dev_attr_fan_mode, "2\n", 2);
-		if (sret < 0)
-			return (int)sret;
-		gigabyte->fan_gaming_boost_active = 0;
-		gigabyte->fan_gaming_boost_level = 0;
-		return 0;
-	}
-
-	duty = fan_gaming_boost_duty[level];
-	sret = fan_mode_store(dev, &dev_attr_fan_mode, "3\n", 2);
-	if (sret < 0)
-		return (int)sret;
-	msleep(100);
-
-	snprintf(speed_buf, sizeof(speed_buf), "%d\n", duty);
-	sret = fan_custom_speed_store(dev, &dev_attr_fan_custom_speed,
-				      speed_buf, strlen(speed_buf));
-	if (sret < 0)
-		return (int)sret;
-	msleep(100);
-
-	if (!gigabyte_fan_gaming_boost_hw_ok(level)) {
-		ret = gigabyte_fan_gaming_boost_apply_usermode(dev, duty);
-		if (ret)
-			return ret;
-		msleep(100);
-	}
-
-	if (!gigabyte_fan_gaming_boost_hw_ok(level))
-		return -EIO;
-
-	gigabyte->fan_gaming_boost_active = 1;
-	gigabyte->fan_gaming_boost_level = level;
-	return 0;
-}
-
-static void gigabyte_fan_gaming_boost_stop(struct gigabyte_laptop_wmi *gigabyte,
-					   struct device *dev)
-{
-	cancel_delayed_work_sync(&gigabyte->fan_gaming_boost_work);
-	gigabyte->fan_gaming_boost_enabled = 0;
-	if (gigabyte->fan_gaming_boost_active)
-		fan_gaming_boost_apply_level(dev, gigabyte, 0);
-	gigabyte->fan_gaming_boost_level = 0;
-}
-
-static void gigabyte_fan_gaming_boost_work_fn(struct work_struct *work)
-{
-	struct gigabyte_laptop_wmi *gigabyte =
-		container_of(to_delayed_work(work),
-			     struct gigabyte_laptop_wmi, fan_gaming_boost_work);
-	struct device *dev = gigabyte->fan_gaming_boost_dev;
-	int gpu_temp, max_rpm, target_level, ret;
-	bool need_apply;
-
-	if (!gigabyte->fan_gaming_boost_enabled)
-		return;
-
-	if (gigabyte->fan_turbo_active) {
-		schedule_delayed_work(&gigabyte->fan_gaming_boost_work,
-			msecs_to_jiffies(FAN_GAMING_BOOST_POLL_MS));
-		return;
-	}
-
-	ret = gigabyte_laptop_get_devstate(TEMP_GPU, &gpu_temp);
-	if (ret)
-		goto reschedule;
-
-	max_rpm = gigabyte_fan_max_rpm();
-	target_level = fan_gaming_boost_compute_level(
-		gigabyte->fan_gaming_boost_level, gpu_temp, max_rpm);
-
-	need_apply = target_level != gigabyte->fan_gaming_boost_level ||
-		     (target_level > 0 &&
-		      !gigabyte_fan_gaming_boost_hw_ok(target_level));
-
-	if (need_apply) {
-		ret = fan_gaming_boost_apply_level(dev, gigabyte, target_level);
-		if (ret)
-			pr_warn("gaming boost: apply level %d failed (%d)\n",
-				target_level, ret);
-		else
-			pr_info("gaming boost: GPU %d°C RPM %d -> level %d (%d%%)\n",
-				gpu_temp, max_rpm, target_level,
-				fan_gaming_boost_duty[target_level]);
-	}
-
-reschedule:
-	if (gigabyte->fan_gaming_boost_enabled)
-		schedule_delayed_work(&gigabyte->fan_gaming_boost_work,
-			msecs_to_jiffies(FAN_GAMING_BOOST_POLL_MS));
-}
-
-static ssize_t fan_gaming_boost_show(struct device *dev,
-				     struct device_attribute *attr, char *buf)
-{
-	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", gigabyte->fan_gaming_boost_enabled);
-}
-
-static ssize_t fan_gaming_boost_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count)
-{
-	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
-	unsigned int enable;
-	int ret;
-
-	ret = kstrtouint(buf, 0, &enable);
-	if (ret)
-		return ret;
-
-	if (enable > 1) {
-		pr_err("Invalid gaming boost value\n");
-		return -EINVAL;
-	}
-
-	if (enable) {
-		if (gigabyte->fan_gaming_boost_enabled)
-			return count;
-
-		if (gigabyte->fan_turbo_active) {
-			pr_err("Disable fan_turbo before enabling gaming boost\n");
-			return -EBUSY;
-		}
-
-		if (gigabyte->fan_mode != 2) {
-			pr_err("fan_gaming_boost requires fan_mode=2 (gaming)\n");
-			return -EINVAL;
-		}
-
-		gigabyte->fan_gaming_boost_enabled = 1;
-		gigabyte->fan_gaming_boost_dev = dev;
-		gigabyte->fan_gaming_boost_level = 0;
-		gigabyte->fan_gaming_boost_active = 0;
-		schedule_delayed_work(&gigabyte->fan_gaming_boost_work, 0);
-		pr_info("gaming boost: enabled\n");
-	} else {
-		if (!gigabyte->fan_gaming_boost_enabled)
-			return count;
-
-		gigabyte_fan_gaming_boost_stop(gigabyte, dev);
-		pr_info("gaming boost: disabled\n");
-	}
-
-	return count;
-}
 
 static bool gigabyte_fan_turbo_hw_active(void)
 {
@@ -1157,6 +863,14 @@ static bool gigabyte_fan_turbo_hw_active(void)
 		return false;
 
 	return true;
+}
+
+static int gigabyte_sysfs_usermode_cmd(char *cmd)
+{
+	char *argv[] = { "/bin/sh", "-c", cmd, NULL };
+	char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
+
+	return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
 }
 
 static int gigabyte_fan_turbo_apply_max(struct device *dev)
@@ -1220,9 +934,6 @@ static void gigabyte_fan_turbo_work_fn(struct work_struct *work)
 	int ret = 0, output;
 
 	if (gigabyte->fan_turbo_work_enable) {
-		if (gigabyte->fan_gaming_boost_enabled)
-			gigabyte_fan_gaming_boost_stop(gigabyte, dev);
-
 		gigabyte->fan_turbo_saved_mode = gigabyte->fan_mode;
 		gigabyte->fan_turbo_saved_display_speed =
 			gigabyte->fan_custom_display_speed;
@@ -1327,7 +1038,6 @@ static struct attribute *gigabyte_laptop_attributes[] = {
 	&dev_attr_gpu_boost.attr,
 	&dev_attr_perf_mode.attr,
 	&dev_attr_fan_turbo.attr,
-	&dev_attr_fan_gaming_boost.attr,
 	&dev_attr_dynamic_boost.attr,
 	&dev_attr_fan_curve_index.attr,
 	&dev_attr_fan_curve_data.attr,
@@ -1341,10 +1051,9 @@ static umode_t gigabyte_laptop_sysfs_is_visible(struct kobject *kobj, struct att
 	struct device *dev = kobj_to_dev(kobj);
 	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
 
-	// Gaming-only sysfs nodes (method IDs absent on Aero/AORUS firmware)
+	// perf_mode/fan_turbo use method IDs only present on Gigabyte Gaming firmware
 	if (attr == &dev_attr_perf_mode.attr || attr == &dev_attr_fan_turbo.attr ||
-	    attr == &dev_attr_fan_gaming_boost.attr ||
-	    attr == &dev_attr_dynamic_boost.attr)
+		attr == &dev_attr_dynamic_boost.attr)
 		return gigabyte->gaming_family ? attr->mode : 0;
 
 	return attr->mode;
@@ -1550,7 +1259,6 @@ static void __exit gigabyte_laptop_exit(void)
 
 	pr_info("Goodbye, World!\n");
 	gigabyte = platform_get_drvdata(platform_device);
-	cancel_delayed_work_sync(&gigabyte->fan_gaming_boost_work);
 	cancel_work_sync(&gigabyte->fan_turbo_work);
 	hwmon_device_unregister(gigabyte->hwmon_dev);
 	sysfs_remove_group(&gigabyte->pdev->dev.kobj, &gigabyte_laptop_attr_group);
@@ -1600,8 +1308,6 @@ static int __init gigabyte_laptop_init(void)
 		gigabyte->gaming_family = 1;
 	INIT_WORK(&gigabyte->fan_turbo_work, gigabyte_fan_turbo_work_fn);
 	init_completion(&gigabyte->fan_turbo_done);
-	INIT_DELAYED_WORK(&gigabyte->fan_gaming_boost_work,
-			  gigabyte_fan_gaming_boost_work_fn);
 	platform_set_drvdata(gigabyte->pdev, gigabyte);
 
 	result = platform_device_add(gigabyte->pdev);
