@@ -31,12 +31,14 @@ The following models are currently supported:
 - All Aero 17 models
 - The Aero 14 OLED (2023)
 - All AORUS models
+- Gigabyte Gaming (2025+) models (validated on the GAMING A16 CWH / GA6CWH).
+  These models get three extra sysfs nodes: `perf_mode`, `dynamic_boost` and
+  `fan_turbo`, which together control the GPU TGP (see [USAGE.md](USAGE.md)).
 
 The following models are compatible, but **not** yet supported:
 
 - All Aero 14 models made before 2019 (see [this issue](https://github.com/tangalbert919/gigabyte-laptop-wmi/issues/7))
 - P series models (e.g. P56XT, P34W, P55W)
-- Gigabyte Gaming (2025+) models (e.g. A16 GA6H)
 
 The following models are not supported:
 

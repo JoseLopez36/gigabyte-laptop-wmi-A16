@@ -45,6 +45,10 @@ MODULE_VERSION(GIGABYTE_LAPTOP_VERSION);
 #define BATT_CYCLE       0x6E
 #define FAN_AUTO_MODE    0x70
 #define FAN_GAMING_MODE  0x71
+// Gigabyte Gaming models (e.g. A16 CWH)
+#define FAN_TURBO        0x7D // EC TFAN bit, max fan speed
+#define DYN_BOOST        0xE7 // NPCF dynamic boost (NOTE: write 0 = enable)
+#define PERF_MODE        0xED // NPCF perf mode, controls GPU TGP/CTGP boost
 #define USB_SLEEP        0x7A
 #define USB_HIBERNATE    0x7B
 #define WIFI_TOGGLE      0xC2
@@ -77,10 +81,12 @@ struct gigabyte_laptop_wmi {
 	int charge_limit;
 	int gpu_boost;
 	int fan_curve_index;
+	int perf_mode;
 
 	u8 fan_silent_method;
 	u8 debug_method;
 	u8 dual_fan_speed_enabled;
+	u8 gaming_family; // Gigabyte Gaming models (e.g. A16 CWH)
 };
 
 static struct platform_device *platform_device;
@@ -151,12 +157,10 @@ static int gigabyte_laptop_set_devstate(u32 method_id, u32 arg2, int *result)
 		return -1;
 
 	obj = buffer.pointer;
+	// Some methods (e.g. 0x7D turbo fan) perform the write without
+	// returning a value; treat any non-integer reply as success.
 	if (obj && obj->type == ACPI_TYPE_INTEGER)
 		*result = obj->integer.value;
-	else {
-		kfree(obj);
-		return -EINVAL;
-	}
 	kfree(obj);
 	return 0;
 }
@@ -581,8 +585,14 @@ static ssize_t gpu_boost_store(struct device *dev, struct device_attribute *attr
 	if (ret)
 		return ret;
 
-	// TODO: Check for AORUS laptops with 4 modes
-	if (mode > 3) {
+	gigabyte = dev_get_drvdata(dev);
+
+	/*
+	 * On Gigabyte Gaming models (e.g. A16 CWH), 0x51 only supports 0/1
+	 * (CTGP boost off/on). Values 3 and 4 send eject/power-off requests
+	 * to the dGPU, so they must never be passed through.
+	 */
+	if ((gigabyte->gaming_family && mode > 1) || mode > 3) {
 		pr_err("Invalid boost mode");
 		return -EINVAL;
 	}
@@ -591,8 +601,118 @@ static ssize_t gpu_boost_store(struct device *dev, struct device_attribute *attr
 	if (ret)
 		return ret;
 
-	gigabyte = dev_get_drvdata(dev);
 	gigabyte->gpu_boost = mode;
+	return count;
+}
+
+/*
+ * Performance mode (Gigabyte Gaming models, e.g. A16 CWH).
+ * Mirrors the Windows Control Center modes by programming the NVIDIA
+ * platform controller (NPCF) through WMBD 0xED:
+ * 0 = eco      (GPU TGP capped low)
+ * 1 = balanced (default-ish limits)
+ * 2 = boost    (max TGP + CTGP boost; on the A16 CWH this lifts the
+ *               RTX 5070's cap from 55W toward 85W)
+ */
+static ssize_t perf_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", gigabyte->perf_mode);
+}
+
+static ssize_t perf_mode_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ret, output;
+	unsigned int mode;
+	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
+
+	ret = kstrtouint(buf, 0, &mode);
+	if (ret)
+		return ret;
+
+	if (mode > 2) {
+		pr_err("Invalid performance mode\n");
+		return -EINVAL;
+	}
+
+	ret = gigabyte_laptop_set_devstate(PERF_MODE, mode, &output);
+	if (ret)
+		return ret;
+
+	gigabyte->perf_mode = mode;
+	return count;
+}
+
+/*
+ * GPU dynamic boost (Gigabyte Gaming models, e.g. A16 CWH).
+ * Lets the NVIDIA driver shift extra power to the GPU under load
+ * (up to Max Power Limit, e.g. 85W on the A16 CWH's RTX 5070).
+ * 0 = off, 1 = on. The firmware argument is inverted (0 enables DBAC),
+ * so flip it here to expose a conventional boolean.
+ */
+static ssize_t dynamic_boost_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int ret, output;
+
+	ret = gigabyte_laptop_get_devstate(DYN_BOOST, &output); // returns DBAC
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%d\n", output);
+}
+
+static ssize_t dynamic_boost_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ret, output;
+	unsigned int enable;
+
+	ret = kstrtouint(buf, 0, &enable);
+	if (ret)
+		return ret;
+
+	if (enable > 1) {
+		pr_err("Invalid dynamic boost value\n");
+		return -EINVAL;
+	}
+
+	ret = gigabyte_laptop_set_devstate(DYN_BOOST, !enable, &output);
+	if (ret)
+		return ret;
+	return count;
+}
+
+/*
+ * Turbo fan (Gigabyte Gaming models, e.g. A16 CWH).
+ * Sets the EC's TFAN bit, which runs the fans at maximum.
+ * 0 = off, 1 = on
+ */
+static ssize_t fan_turbo_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int ret, output;
+
+	ret = gigabyte_laptop_get_devstate(FAN_TURBO, &output);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%d\n", output);
+}
+
+static ssize_t fan_turbo_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ret, output;
+	unsigned int enable;
+
+	ret = kstrtouint(buf, 0, &enable);
+	if (ret)
+		return ret;
+
+	if (enable > 1) {
+		pr_err("Invalid turbo fan value\n");
+		return -EINVAL;
+	}
+
+	ret = gigabyte_laptop_set_devstate(FAN_TURBO, enable, &output);
+	if (ret)
+		return ret;
 	return count;
 }
 
@@ -715,6 +835,9 @@ static DEVICE_ATTR_RW(fan_custom_speed);
 static DEVICE_ATTR_RW(charge_mode);
 static DEVICE_ATTR_RW(charge_limit);
 static DEVICE_ATTR_RW(gpu_boost);
+static DEVICE_ATTR_RW(perf_mode);
+static DEVICE_ATTR_RW(fan_turbo);
+static DEVICE_ATTR_RW(dynamic_boost);
 static DEVICE_ATTR_RW(fan_curve_index);
 static DEVICE_ATTR_RW(fan_curve_data);
 static DEVICE_ATTR_RO(battery_cycle);
@@ -728,6 +851,9 @@ static struct attribute *gigabyte_laptop_attributes[] = {
 	&dev_attr_usb_charge_s3_toggle.attr,
 	&dev_attr_usb_charge_s4_toggle.attr,
 	&dev_attr_gpu_boost.attr,
+	&dev_attr_perf_mode.attr,
+	&dev_attr_fan_turbo.attr,
+	&dev_attr_dynamic_boost.attr,
 	&dev_attr_fan_curve_index.attr,
 	&dev_attr_fan_curve_data.attr,
 	&dev_attr_battery_cycle.attr,
@@ -735,8 +861,21 @@ static struct attribute *gigabyte_laptop_attributes[] = {
 	NULL
 };
 
+static umode_t gigabyte_laptop_sysfs_is_visible(struct kobject *kobj, struct attribute *attr, int idx)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
+
+	// perf_mode/fan_turbo use method IDs only present on Gigabyte Gaming firmware
+	if (attr == &dev_attr_perf_mode.attr || attr == &dev_attr_fan_turbo.attr ||
+		attr == &dev_attr_dynamic_boost.attr)
+		return gigabyte->gaming_family ? attr->mode : 0;
+
+	return attr->mode;
+}
+
 static const struct attribute_group gigabyte_laptop_attr_group = {
-	//.is_visible = gigabyte_laptop_sysfs_is_visible,
+	.is_visible = gigabyte_laptop_sysfs_is_visible,
 	.attrs = gigabyte_laptop_attributes,
 };
 
@@ -813,8 +952,12 @@ static int gigabyte_laptop_probe(struct device *dev)
 
 	// Older devices are using a different method ID for silent fan mode.
 	// In that case, newer devices won't return anything when using that ID.
-	ret = gigabyte_laptop_get_devstate(FAN_SILENT_OLD, &output);
-	if (output < 0) { // -1 on newer devices
+	// Gigabyte Gaming firmware (e.g. A16 CWH) implements neither: its WMBC
+	// default case echoes the argument back, and its WMBD 0xFA is an empty
+	// stub, so probe with a sentinel value to detect the echo.
+	output = -1;
+	ret = gigabyte_laptop_get_devstate2(FAN_SILENT_OLD, 0xFA51, &output);
+	if (ret || output < 0 || output == 0xFA51) {
 		pr_info("Newer model detected, using new silent fan mode ID");
 		gigabyte->fan_silent_method = FAN_SILENT_MODE;
 	}
@@ -975,6 +1118,8 @@ static int __init gigabyte_laptop_init(void)
 	}
 
 	gigabyte->pdev = platform_device;
+	if (!strcmp(dmi_get_system_info(DMI_PRODUCT_FAMILY), "GIGABYTE GAMING"))
+		gigabyte->gaming_family = 1;
 	platform_set_drvdata(gigabyte->pdev, gigabyte);
 
 	result = platform_device_add(gigabyte->pdev);

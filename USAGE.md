@@ -110,6 +110,49 @@ Laptops with RTX 3000 series GPUs or newer have three different modes, while old
 echo '1' | sudo tee /sys/devices/platform/aorus_laptop/gpu_boost
 ```
 
+## Performance mode (Gigabyte Gaming models only)
+
+Gigabyte Gaming models (e.g. GAMING A16 CWH) expose the Control Center
+performance modes, which program the NVIDIA platform controller (NPCF) and set
+the discrete GPU's power limit (TGP). Modes:
+- 0 = eco (lowest TGP)
+- 1 = balanced
+- 2 = boost (highest TGP)
+
+On the A16 CWH (RTX 5070), boost mode with GPU boost enabled raises the GPU
+power limit from 55W to 70W, and dynamic boost can add up to 15W more under
+load (85W max).
+
+**Node:** `/sys/devices/platform/aorus_laptop/perf_mode`
+
+**Example:** To unlock the maximum GPU TGP:
+```
+echo '2' | sudo tee /sys/devices/platform/aorus_laptop/perf_mode
+echo '1' | sudo tee /sys/devices/platform/aorus_laptop/gpu_boost
+echo '1' | sudo tee /sys/devices/platform/aorus_laptop/dynamic_boost
+```
+Note: the firmware resets to its default mode on reboot, so re-apply after boot
+(or use a systemd unit/udev rule).
+
+## Dynamic boost (Gigabyte Gaming models only)
+
+Toggles NVIDIA Dynamic Boost (the EC's `DBAC` flag), letting the GPU driver
+temporarily shift extra power to the GPU under load. 0 = off, 1 = on.
+
+**Node:** `/sys/devices/platform/aorus_laptop/dynamic_boost`
+
+## Turbo fan (Gigabyte Gaming models only)
+
+Runs the fans at maximum speed (the EC's `TFAN` bit). 0 = off, 1 = on.
+
+**Node:** `/sys/devices/platform/aorus_laptop/fan_turbo`
+
+## GPU boost on Gigabyte Gaming models
+
+On Gigabyte Gaming models, `gpu_boost` only accepts 0 or 1 (CTGP boost off/on).
+Values 2 and 3 are rejected by the driver because the firmware maps them to
+dGPU eject and power-off requests on these models.
+
 ## USB toggles (added in version 0.1.0)
 
 Aero/AORUS laptops support USB power output when they are asleep (S3) or in hibernation (S4). Newer models have dropped the latter, and will return 0 by default. These toggles are currently read-only.
