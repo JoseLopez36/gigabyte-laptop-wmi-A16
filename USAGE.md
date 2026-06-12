@@ -143,9 +143,17 @@ temporarily shift extra power to the GPU under load. 0 = off, 1 = on.
 
 ## Turbo fan (Gigabyte Gaming models only)
 
-Runs the fans at maximum speed (the EC's `TFAN` bit). 0 = off, 1 = on.
+Runs the fans at maximum speed (~6500 RPM on the A16 CWH). The driver
+engages custom fan mode at 100% duty (WMI `TENF` + max duty `0xE5`).
+Disabling restores the fan mode that was active before turbo was enabled.
+0 = off, 1 = on.
 
 **Node:** `/sys/devices/platform/aorus_laptop/fan_turbo`
+
+**Example:**
+```
+echo '1' | sudo tee /sys/devices/platform/aorus_laptop/fan_turbo
+```
 
 ## GPU boost on Gigabyte Gaming models
 

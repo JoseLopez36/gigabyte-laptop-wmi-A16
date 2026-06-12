@@ -8,6 +8,8 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/acpi.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
@@ -15,6 +17,8 @@
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
+#include <linux/umh.h>
+#include <linux/workqueue.h>
 #include <linux/wmi.h>
 
 #define GIGABYTE_LAPTOP_VERSION "0.01"
@@ -63,6 +67,7 @@ MODULE_VERSION(GIGABYTE_LAPTOP_VERSION);
 
 // Fan curves
 #define FAN_CURVE_POINTS 15
+#define FAN_DUTY_MAX     0xE5 // 100% custom fan duty
 
 struct fan_curve_data {
 	u8 temperature[FAN_CURVE_POINTS];
@@ -87,6 +92,15 @@ struct gigabyte_laptop_wmi {
 	u8 debug_method;
 	u8 dual_fan_speed_enabled;
 	u8 gaming_family; // Gigabyte Gaming models (e.g. A16 CWH)
+	u8 fan_turbo_active;
+	int fan_turbo_saved_mode;
+	int fan_turbo_saved_display_speed;
+	int fan_turbo_saved_internal_speed;
+	struct work_struct fan_turbo_work;
+	struct completion fan_turbo_done;
+	struct device *fan_turbo_dev;
+	bool fan_turbo_work_enable;
+	int fan_turbo_work_result;
 };
 
 static struct platform_device *platform_device;
@@ -398,14 +412,26 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
 	ret = kstrtouint(buf, 0, &fan_mode);
 	if (ret) {
 		pr_err("kstrtouint failed\n");
-		return count;
+		return ret;
 	}
 
 	gigabyte = dev_get_drvdata(dev);
 
 	if (gigabyte->fan_mode == fan_mode) {
-		pr_warn("Already set to that fan mode\n");
-		return count;
+		int tenf;
+
+		/*
+		 * Custom mode can look enabled in software while TENF is off in
+		 * the EC (e.g. after a failed turbo attempt). Re-apply.
+		 */
+		if (fan_mode == 3) {
+			ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_MODE, &tenf);
+			if (!ret && tenf)
+				return count;
+		} else {
+			pr_warn("Already set to that fan mode\n");
+			return count;
+		}
 	}
 
 	if (fan_mode > 5) {
@@ -421,6 +447,26 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
+static int gigabyte_set_fan_custom_speed(struct gigabyte_laptop_wmi *gigabyte,
+					 u8 real_speed, int display_speed)
+{
+	int ret, output;
+
+	ret = gigabyte_laptop_set_devstate(FAN_CUSTOM_SPEED, real_speed, &output);
+	if (ret)
+		return ret;
+
+	if (gigabyte->dual_fan_speed_enabled) {
+		ret = ec_write(0xB1, real_speed);
+		if (ret)
+			return ret;
+	}
+
+	gigabyte->fan_custom_display_speed = display_speed;
+	gigabyte->fan_custom_internal_speed = real_speed;
+	return 0;
+}
+
 /*
  * Custom fan speed. Only works if custom mode is enabled.
  * Must be in multiples of five, between 25 and 100.
@@ -434,7 +480,7 @@ static ssize_t fan_custom_speed_show(struct device *dev, struct device_attribute
 
 static ssize_t fan_custom_speed_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
-	int ret, output;
+	int ret;
 	unsigned int speed;
 	u8 real_speed;
 	struct gigabyte_laptop_wmi *gigabyte;
@@ -481,18 +527,10 @@ static ssize_t fan_custom_speed_store(struct device *dev, struct device_attribut
 	else if (speed == 100)
 		real_speed = 0xE5;
 
-	ret = gigabyte_laptop_set_devstate(FAN_CUSTOM_SPEED, real_speed, &output);
+	gigabyte = dev_get_drvdata(dev);
+	ret = gigabyte_set_fan_custom_speed(gigabyte, real_speed, speed);
 	if (ret)
 		return ret;
-
-	gigabyte = dev_get_drvdata(dev);
-	if (gigabyte->dual_fan_speed_enabled) {
-		// We can't modify FAN2 through WMI without modifying GFTY, which
-		// already changes on its own.
-		ret = ec_write(0xB1, real_speed);
-	}
-	gigabyte->fan_custom_display_speed = speed;
-	gigabyte->fan_custom_internal_speed = real_speed;
 	return count;
 }
 
@@ -681,40 +719,9 @@ static ssize_t dynamic_boost_store(struct device *dev, struct device_attribute *
 	return count;
 }
 
-/*
- * Turbo fan (Gigabyte Gaming models, e.g. A16 CWH).
- * Sets the EC's TFAN bit, which runs the fans at maximum.
- * 0 = off, 1 = on
- */
-static ssize_t fan_turbo_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	int ret, output;
-
-	ret = gigabyte_laptop_get_devstate(FAN_TURBO, &output);
-	if (ret)
-		return ret;
-	return sysfs_emit(buf, "%d\n", output);
-}
-
-static ssize_t fan_turbo_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	int ret, output;
-	unsigned int enable;
-
-	ret = kstrtouint(buf, 0, &enable);
-	if (ret)
-		return ret;
-
-	if (enable > 1) {
-		pr_err("Invalid turbo fan value\n");
-		return -EINVAL;
-	}
-
-	ret = gigabyte_laptop_set_devstate(FAN_TURBO, enable, &output);
-	if (ret)
-		return ret;
-	return count;
-}
+static ssize_t fan_turbo_show(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t fan_turbo_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count);
 
 static ssize_t fan_curve_index_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -842,6 +849,184 @@ static DEVICE_ATTR_RW(fan_curve_index);
 static DEVICE_ATTR_RW(fan_curve_data);
 static DEVICE_ATTR_RO(battery_cycle);
 static DEVICE_ATTR_RW(debug_method);
+
+static bool gigabyte_fan_turbo_hw_active(void)
+{
+	int tenf, duty, ret;
+
+	ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_MODE, &tenf);
+	if (ret || !tenf)
+		return false;
+
+	ret = gigabyte_laptop_get_devstate(FAN_CUSTOM_SPEED, &duty);
+	if (ret || duty != FAN_DUTY_MAX)
+		return false;
+
+	return true;
+}
+
+static int gigabyte_sysfs_usermode_cmd(char *cmd)
+{
+	char *argv[] = { "/bin/sh", "-c", cmd, NULL };
+	char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
+
+	return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+}
+
+static int gigabyte_fan_turbo_apply_max(struct device *dev)
+{
+	ssize_t ret;
+
+	ret = fan_mode_store(dev, &dev_attr_fan_mode, "3\n", 2);
+	if (ret < 0)
+		return (int)ret;
+
+	msleep(100);
+
+	ret = fan_custom_speed_store(dev, &dev_attr_fan_custom_speed,
+				     "100\n", 4);
+	if (ret < 0)
+		return (int)ret;
+
+	msleep(100);
+
+	if (!gigabyte_fan_turbo_hw_active())
+		return -EIO;
+
+	return 0;
+}
+
+static int gigabyte_fan_turbo_apply_max_usermode(struct device *dev)
+{
+	char *kpath, *cmd;
+	int ret;
+
+	kpath = kobject_get_path(&dev->kobj, GFP_KERNEL);
+	if (!kpath)
+		return -ENOMEM;
+
+	cmd = kasprintf(GFP_KERNEL,
+			"echo 3 > /sys%s/fan_mode && echo 100 > /sys%s/fan_custom_speed",
+			kpath, kpath);
+	kfree(kpath);
+	if (!cmd)
+		return -ENOMEM;
+
+	ret = gigabyte_sysfs_usermode_cmd(cmd);
+	kfree(cmd);
+	if (ret)
+		return ret;
+
+	msleep(100);
+
+	if (!gigabyte_fan_turbo_hw_active())
+		return -EIO;
+
+	return 0;
+}
+
+static void gigabyte_fan_turbo_work_fn(struct work_struct *work)
+{
+	struct gigabyte_laptop_wmi *gigabyte =
+		container_of(work, struct gigabyte_laptop_wmi, fan_turbo_work);
+	struct device *dev = gigabyte->fan_turbo_dev;
+	char mode_buf[8];
+	int ret = 0, output;
+
+	if (gigabyte->fan_turbo_work_enable) {
+		gigabyte->fan_turbo_saved_mode = gigabyte->fan_mode;
+		gigabyte->fan_turbo_saved_display_speed =
+			gigabyte->fan_custom_display_speed;
+		gigabyte->fan_turbo_saved_internal_speed =
+			gigabyte->fan_custom_internal_speed;
+
+		ret = gigabyte_fan_turbo_apply_max(dev);
+		if (ret) {
+			pr_info("turbo fan: sysfs store path failed (%d), trying shell\n",
+				ret);
+			ret = gigabyte_fan_turbo_apply_max_usermode(dev);
+		}
+		if (ret) {
+			pr_warn("turbo fan: enable failed (%d)\n", ret);
+			goto done;
+		}
+
+		gigabyte->fan_turbo_active = 1;
+		pr_info("turbo fan: enabled\n");
+	} else {
+		if (!gigabyte->fan_turbo_active)
+			goto done;
+
+		gigabyte_laptop_set_devstate(FAN_TURBO, 0, &output);
+
+		snprintf(mode_buf, sizeof(mode_buf), "%d\n",
+			 gigabyte->fan_turbo_saved_mode);
+		ret = fan_mode_store(dev, &dev_attr_fan_mode, mode_buf,
+				     strlen(mode_buf));
+		if (ret < 0) {
+			pr_warn("turbo fan: restore fan_mode failed (%d)\n",
+				(int)ret);
+			goto done;
+		}
+
+		gigabyte->fan_turbo_active = 0;
+		pr_info("turbo fan: disabled\n");
+	}
+
+done:
+	gigabyte->fan_turbo_work_result = ret;
+	complete(&gigabyte->fan_turbo_done);
+}
+
+/*
+ * Turbo fan (Gigabyte Gaming models, e.g. A16 CWH).
+ * Engages custom mode at 100% duty. TFAN is not written on enable because it
+ * can latch while TENF is still off on the A16 CWH.
+ */
+static ssize_t fan_turbo_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
+
+	if (gigabyte->fan_turbo_active && !gigabyte_fan_turbo_hw_active())
+		gigabyte->fan_turbo_active = 0;
+
+	return sysfs_emit(buf, "%d\n", gigabyte->fan_turbo_active);
+}
+
+static ssize_t fan_turbo_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
+	unsigned int enable;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &enable);
+	if (ret)
+		return ret;
+
+	if (enable > 1) {
+		pr_err("Invalid turbo fan value\n");
+		return -EINVAL;
+	}
+
+	if (enable) {
+		if (gigabyte->fan_turbo_active && gigabyte_fan_turbo_hw_active())
+			return count;
+		gigabyte->fan_turbo_active = 0;
+	} else if (!gigabyte->fan_turbo_active) {
+		return count;
+	}
+
+	gigabyte->fan_turbo_work_enable = enable;
+	gigabyte->fan_turbo_dev = dev;
+	reinit_completion(&gigabyte->fan_turbo_done);
+	queue_work(system_unbound_wq, &gigabyte->fan_turbo_work);
+	wait_for_completion(&gigabyte->fan_turbo_done);
+
+	if (gigabyte->fan_turbo_work_result)
+		return gigabyte->fan_turbo_work_result;
+	return count;
+}
 
 static struct attribute *gigabyte_laptop_attributes[] = {
 	&dev_attr_fan_mode.attr,
@@ -1074,6 +1259,7 @@ static void __exit gigabyte_laptop_exit(void)
 
 	pr_info("Goodbye, World!\n");
 	gigabyte = platform_get_drvdata(platform_device);
+	cancel_work_sync(&gigabyte->fan_turbo_work);
 	hwmon_device_unregister(gigabyte->hwmon_dev);
 	sysfs_remove_group(&gigabyte->pdev->dev.kobj, &gigabyte_laptop_attr_group);
 	platform_driver_unregister(&platform_driver);
@@ -1120,6 +1306,8 @@ static int __init gigabyte_laptop_init(void)
 	gigabyte->pdev = platform_device;
 	if (!strcmp(dmi_get_system_info(DMI_PRODUCT_FAMILY), "GIGABYTE GAMING"))
 		gigabyte->gaming_family = 1;
+	INIT_WORK(&gigabyte->fan_turbo_work, gigabyte_fan_turbo_work_fn);
+	init_completion(&gigabyte->fan_turbo_done);
 	platform_set_drvdata(gigabyte->pdev, gigabyte);
 
 	result = platform_device_add(gigabyte->pdev);
