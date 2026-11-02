@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
+#include <linux/pm.h>
 #include <linux/umh.h>
 #include <linux/workqueue.h>
 #include <linux/wmi.h>
@@ -87,6 +88,7 @@ struct gigabyte_laptop_wmi {
 	int gpu_boost;
 	int fan_curve_index;
 	int perf_mode;
+	u8 dynamic_boost;
 
 	u8 fan_silent_method;
 	u8 debug_method;
@@ -703,6 +705,7 @@ static ssize_t dynamic_boost_store(struct device *dev, struct device_attribute *
 {
 	int ret, output;
 	unsigned int enable;
+	struct gigabyte_laptop_wmi *gigabyte;
 
 	ret = kstrtouint(buf, 0, &enable);
 	if (ret)
@@ -716,6 +719,9 @@ static ssize_t dynamic_boost_store(struct device *dev, struct device_attribute *
 	ret = gigabyte_laptop_set_devstate(DYN_BOOST, !enable, &output);
 	if (ret)
 		return ret;
+
+	gigabyte = dev_get_drvdata(dev);
+	gigabyte->dynamic_boost = enable;
 	return count;
 }
 
@@ -1257,13 +1263,97 @@ obtain_custom_fan_speed:
 		}
 	}
 
+	if (gigabyte->gaming_family) {
+		ret = gigabyte_laptop_get_devstate(DYN_BOOST, &output);
+		if (!ret)
+			gigabyte->dynamic_boost = !!output;
+	}
+
 	return 0;
 }
+
+static int gigabyte_laptop_reapply_state(struct device *dev)
+{
+	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
+	int ret, output;
+	int saved_fan_mode = gigabyte->fan_mode;
+
+	ret = set_fan_mode(gigabyte, fan_modes[saved_fan_mode]);
+	if (ret)
+		pr_warn("resume: fan mode reapply failed (%d)\n", ret);
+	else
+		gigabyte->fan_mode = saved_fan_mode;
+
+	if (gigabyte->fan_custom_internal_speed) {
+		ret = gigabyte_set_fan_custom_speed(gigabyte,
+				gigabyte->fan_custom_internal_speed,
+				gigabyte->fan_custom_display_speed);
+		if (ret)
+			pr_warn("resume: fan speed reapply failed (%d)\n", ret);
+	}
+
+	if (gigabyte->charge_mode) {
+		ret = gigabyte_laptop_set_devstate(CHARGING_MODE,
+				gigabyte->charge_mode << 2, &output);
+		if (ret)
+			pr_warn("resume: charge mode reapply failed (%d)\n", ret);
+	}
+
+	if (gigabyte->charge_limit) {
+		ret = gigabyte_laptop_set_devstate(CHARGING_LIMIT,
+				gigabyte->charge_limit, &output);
+		if (ret)
+			pr_warn("resume: charge limit reapply failed (%d)\n", ret);
+	}
+
+	if (gigabyte->gaming_family) {
+		ret = gigabyte_laptop_set_devstate(PERF_MODE,
+				gigabyte->perf_mode, &output);
+		if (ret)
+			pr_warn("resume: perf_mode reapply failed (%d)\n", ret);
+
+		ret = gigabyte_laptop_set_devstate(GPU_QBOOST,
+				gigabyte->gpu_boost, &output);
+		if (ret)
+			pr_warn("resume: gpu_boost reapply failed (%d)\n", ret);
+
+		ret = gigabyte_laptop_set_devstate(DYN_BOOST,
+				!gigabyte->dynamic_boost, &output);
+		if (ret)
+			pr_warn("resume: dynamic_boost reapply failed (%d)\n", ret);
+	}
+
+	if (gigabyte->fan_turbo_active) {
+		ret = gigabyte_fan_turbo_apply_max(dev);
+		if (ret)
+			pr_warn("resume: fan_turbo reapply failed (%d)\n", ret);
+	}
+
+	return 0;
+}
+
+static int gigabyte_laptop_suspend(struct device *dev)
+{
+	struct gigabyte_laptop_wmi *gigabyte = dev_get_drvdata(dev);
+
+	cancel_work_sync(&gigabyte->fan_turbo_work);
+	return 0;
+}
+
+static int gigabyte_laptop_resume(struct device *dev)
+{
+	return gigabyte_laptop_reapply_state(dev);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(gigabyte_laptop_pm_ops,
+			      gigabyte_laptop_suspend,
+			      gigabyte_laptop_resume);
 
 static struct platform_driver platform_driver = {
 	.driver = {
 		.name = GIGABYTE_LAPTOP_FILE,
 		.owner = THIS_MODULE,
+		.pm = &gigabyte_laptop_pm_ops,
 	},
 };
 
